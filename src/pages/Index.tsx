@@ -128,6 +128,40 @@ function formatTime(isoStr: string) {
   return d.toLocaleDateString('ru', { day: '2-digit', month: '2-digit' });
 }
 
+// ─── Auth Card wrapper (вне LoginScreen чтобы не пересоздаваться при вводе) ──
+function AuthCard({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={{
+      minHeight: '100vh',
+      background: 'linear-gradient(135deg, #1a4a7a 0%, #2878c0 40%, #1c5a8a 100%)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontFamily: "'Rubik', 'Tahoma', sans-serif",
+    }}>
+      <div style={{
+        position: 'fixed', inset: 0, opacity: 0.04,
+        backgroundImage: 'radial-gradient(circle, white 1px, transparent 1px)',
+        backgroundSize: '30px 30px', pointerEvents: 'none',
+      }} />
+      <div style={{
+        background: 'white', borderRadius: 8,
+        boxShadow: '0 20px 60px rgba(0,0,0,0.4)', width: 360, overflow: 'hidden',
+      }}>
+        <div style={{
+          background: 'linear-gradient(180deg, #3a8fd4 0%, #1c5a8a 100%)',
+          padding: '22px 20px 18px', textAlign: 'center',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 10 }}>
+            <ICQFlower size={52} />
+          </div>
+          <div style={{ color: 'white', fontSize: 22, fontWeight: 700, letterSpacing: 2 }}>ICQ</div>
+          <div style={{ color: 'rgba(255,255,255,0.7)', fontSize: 11, marginTop: 2 }}>I Seek You</div>
+        </div>
+        <div style={{ padding: '22px 24px 26px' }}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Login Screen ───────────────────────────────────────────────────────────
 function LoginScreen({ onLogin }: { onLogin: (token: string, user: User) => void }) {
   // 'choice' → выбор входа/регистрации
@@ -222,37 +256,6 @@ function LoginScreen({ onLogin }: { onLogin: (token: string, user: User) => void
     setDemoUrls(null);
     setConfirmToken('');
   }
-
-  const AuthCard = ({ children }: { children: React.ReactNode }) => (
-    <div style={{
-      minHeight: '100vh',
-      background: 'linear-gradient(135deg, #1a4a7a 0%, #2878c0 40%, #1c5a8a 100%)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      fontFamily: "'Rubik', 'Tahoma', sans-serif",
-    }}>
-      <div style={{
-        position: 'fixed', inset: 0, opacity: 0.04,
-        backgroundImage: 'radial-gradient(circle, white 1px, transparent 1px)',
-        backgroundSize: '30px 30px', pointerEvents: 'none',
-      }} />
-      <div className="animate-scale-in" style={{
-        background: 'white', borderRadius: 8,
-        boxShadow: '0 20px 60px rgba(0,0,0,0.4)', width: 360, overflow: 'hidden',
-      }}>
-        <div style={{
-          background: 'linear-gradient(180deg, #3a8fd4 0%, #1c5a8a 100%)',
-          padding: '22px 20px 18px', textAlign: 'center',
-        }}>
-          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 10 }}>
-            <ICQFlower size={52} />
-          </div>
-          <div style={{ color: 'white', fontSize: 22, fontWeight: 700, letterSpacing: 2 }}>ICQ</div>
-          <div style={{ color: 'rgba(255,255,255,0.7)', fontSize: 11, marginTop: 2 }}>I Seek You</div>
-        </div>
-        <div style={{ padding: '22px 24px 26px' }}>{children}</div>
-      </div>
-    </div>
-  );
 
   // ── Экран выбора ────────────────────────────────────────────────────────────
   if (step === 'choice') return (
