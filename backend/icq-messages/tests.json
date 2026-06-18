@@ -1,0 +1,13 @@
+{
+  "tests": [
+    {
+      "name": "Health check",
+      "method": "GET",
+      "path": "/",
+      "expectedStatus": 401,
+      "expectedBody": {"error": "Нет токена"},
+      "bodyMatcher": "partial",
+      "responseType": "json_string"
+    }
+  ]
+}
