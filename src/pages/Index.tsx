@@ -133,8 +133,9 @@ function LoginScreen({ onLogin }: { onLogin: (token: string, user: User) => void
   // 'choice' → выбор входа/регистрации
   // 'register' → форма регистрации (телефон + никнейм)
   // 'login-phone' → ввод телефона для входа
-  // 'login-waiting' → ожидаем подтверждения по SMS
-  const [step, setStep] = useState<'choice' | 'register' | 'login-phone' | 'login-waiting'>('choice');
+  // 'waiting' → ожидаем подтверждения по SMS (и для входа, и для регистрации)
+  const [step, setStep] = useState<'choice' | 'register' | 'login-phone' | 'waiting'>('choice');
+  const [waitingType, setWaitingType] = useState<'login' | 'register'>('login');
   const [phone, setPhone] = useState('');
   const [nickname, setNickname] = useState('');
   const [loading, setLoading] = useState(false);
@@ -148,7 +149,7 @@ function LoginScreen({ onLogin }: { onLogin: (token: string, user: User) => void
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, []);
 
-  // ── Регистрация ─────────────────────────────────────────────────────────────
+  // ── Регистрация — отправить запрос на SMS ───────────────────────────────────
   async function register() {
     if (!phone.trim() || !nickname.trim()) { setError('Заполни все поля'); return; }
     setLoading(true); setError('');
@@ -160,7 +161,11 @@ function LoginScreen({ onLogin }: { onLogin: (token: string, user: User) => void
       });
       const d = await r.json();
       if (!d.success) { setError(d.error || 'Ошибка'); return; }
-      onLogin(d.token, d.user);
+      setConfirmToken(d.request_token);
+      if (d.demo) setDemoUrls({ yes: d.yes_url, no: d.no_url });
+      setWaitingType('register');
+      setStep('waiting');
+      startPolling(d.request_token);
     } catch { setError('Ошибка сети'); }
     finally { setLoading(false); }
   }
@@ -179,7 +184,8 @@ function LoginScreen({ onLogin }: { onLogin: (token: string, user: User) => void
       if (!d.success) { setError(d.error || 'Ошибка'); return; }
       setConfirmToken(d.request_token);
       if (d.demo) setDemoUrls({ yes: d.yes_url, no: d.no_url });
-      setStep('login-waiting');
+      setWaitingType('login');
+      setStep('waiting');
       startPolling(d.request_token);
     } catch { setError('Ошибка сети'); }
     finally { setLoading(false); }
@@ -197,12 +203,12 @@ function LoginScreen({ onLogin }: { onLogin: (token: string, user: User) => void
           onLogin(d.token, d.user);
         } else if (d.status === 'rejected') {
           clearInterval(pollRef.current!);
-          setStep('login-phone');
-          setError('Вход отклонён. Это были не вы?');
+          setStep(waitingType === 'register' ? 'register' : 'login-phone');
+          setError(waitingType === 'register' ? 'Регистрация отменена.' : 'Вход отклонён.');
           setDemoUrls(null);
         } else if (d.status === 'expired') {
           clearInterval(pollRef.current!);
-          setStep('login-phone');
+          setStep(waitingType === 'register' ? 'register' : 'login-phone');
           setError('Время вышло. Попробуй снова.');
           setDemoUrls(null);
         }
@@ -212,7 +218,7 @@ function LoginScreen({ onLogin }: { onLogin: (token: string, user: User) => void
 
   function cancelWaiting() {
     if (pollRef.current) clearInterval(pollRef.current);
-    setStep('login-phone');
+    setStep(waitingType === 'register' ? 'register' : 'login-phone');
     setDemoUrls(null);
     setConfirmToken('');
   }
@@ -327,17 +333,20 @@ function LoginScreen({ onLogin }: { onLogin: (token: string, user: User) => void
     </AuthCard>
   );
 
-  // ── Ожидание подтверждения ──────────────────────────────────────────────────
-  if (step === 'login-waiting') return (
+  // ── Ожидание подтверждения (вход или регистрация) ──────────────────────────
+  if (step === 'waiting') return (
     <AuthCard>
       <div className="animate-fade-in" style={{ textAlign: 'center' }}>
         <div style={{ fontSize: 40, marginBottom: 12 }}>📱</div>
         <div style={{ fontSize: 15, fontWeight: 600, color: '#1c5a8a', marginBottom: 8 }}>
-          Подтвердите вход
+          {waitingType === 'register' ? 'Подтвердите регистрацию' : 'Подтвердите вход'}
         </div>
         <div style={{ fontSize: 12, color: '#6a7a8a', marginBottom: 20, lineHeight: 1.6 }}>
           На номер <strong>{phone}</strong> отправлено SMS.<br />
-          Нажмите <strong>«Да»</strong> в сообщении, чтобы войти.
+          {waitingType === 'register'
+            ? <>Нажмите <strong>«Да»</strong> — и аккаунт будет создан.</>
+            : <>Нажмите <strong>«Да»</strong> в сообщении, чтобы войти.</>
+          }
         </div>
 
         {/* Анимированный индикатор ожидания */}
@@ -366,7 +375,7 @@ function LoginScreen({ onLogin }: { onLogin: (token: string, user: User) => void
                 fontSize: 13, fontWeight: 700, textAlign: 'center', display: 'block',
                 boxShadow: '0 2px 8px rgba(56,142,60,0.4)',
               }}>
-                ✅ Да, это я
+                {waitingType === 'register' ? '✅ Да, хочу' : '✅ Да, это я'}
               </a>
               <a href={demoUrls.no} target="_blank" rel="noreferrer" style={{
                 flex: 1, padding: '10px', borderRadius: 4, textDecoration: 'none',
@@ -374,7 +383,7 @@ function LoginScreen({ onLogin }: { onLogin: (token: string, user: User) => void
                 fontSize: 13, fontWeight: 700, textAlign: 'center', display: 'block',
                 boxShadow: '0 2px 8px rgba(198,40,40,0.4)',
               }}>
-                ❌ Нет, не я
+                {waitingType === 'register' ? '❌ Нет' : '❌ Нет, не я'}
               </a>
             </div>
           </div>

@@ -31,12 +31,16 @@ def normalize_phone(phone):
         p = '+7' + p.lstrip('7').lstrip('8')
     return p
 
-def send_sms_confirm(phone, confirm_token, base_url):
-    """Отправляем SMS со ссылками Да/Нет для подтверждения входа"""
+def send_sms(phone, confirm_token, base_url, request_type='login'):
+    """Отправляем SMS со ссылками Да/Нет"""
     sms_api_key = os.environ.get('SMSRU_API_KEY', '')
     yes_url = f'{base_url}/confirm-login?token={confirm_token}&answer=yes'
     no_url  = f'{base_url}/confirm-login?token={confirm_token}&answer=no'
-    msg = f'ICQ: Кто-то входит в ваш аккаунт. Это вы?\n✅ Да: {yes_url}\n❌ Нет: {no_url}'
+
+    if request_type == 'register':
+        msg = f'ICQ: Вы хотите зарегистрировать аккаунт?\nДа: {yes_url}\nНет: {no_url}'
+    else:
+        msg = f'ICQ: Кто-то входит в ваш аккаунт. Это вы?\nДа: {yes_url}\nНет: {no_url}'
 
     if not sms_api_key:
         return {'demo': True, 'yes_url': yes_url, 'no_url': no_url}
@@ -74,8 +78,28 @@ def handler(event: dict, context) -> dict:
     headers_in = event.get('headers', {})
     auth_token = headers_in.get('X-Auth-Token') or headers_in.get('x-auth-token', '')
 
+    base_url = os.environ.get('AUTH_BASE_URL', 'https://functions.poehali.dev/e32fdd23-017b-4fb1-9618-d70e0b0977d0')
+    demo_mode = not os.environ.get('SMSRU_API_KEY')
+
+    def make_request(phone, request_type, nickname=''):
+        confirm_token = secrets.token_hex(24)
+        expires = datetime.now() + timedelta(minutes=10)
+        db2 = get_db(); cur2 = db2.cursor()
+        cur2.execute(
+            "INSERT INTO icq_login_requests (token, phone, status, expires_at, nickname, request_type) "
+            "VALUES (%s, %s, 'pending', %s, %s, %s)",
+            (confirm_token, phone, expires, nickname, request_type)
+        )
+        db2.commit(); cur2.close(); db2.close()
+        send_sms(phone, confirm_token, base_url, request_type)
+        resp = {'success': True, 'request_token': confirm_token, 'demo': demo_mode}
+        if demo_mode:
+            resp['yes_url'] = f'{base_url}/confirm-login?token={confirm_token}&answer=yes'
+            resp['no_url']  = f'{base_url}/confirm-login?token={confirm_token}&answer=no'
+        return resp
+
     # ── POST /register ─────────────────────────────────────────────────────────
-    # Новый пользователь: телефон + никнейм → сразу создаём аккаунт и выдаём сессию
+    # Новый пользователь: телефон + никнейм → шлём SMS «Хотите зарегистрироваться?»
     if method == 'POST' and '/register' in path:
         body = json.loads(event.get('body') or '{}')
         phone = normalize_phone(body.get('phone', ''))
@@ -85,45 +109,19 @@ def handler(event: dict, context) -> dict:
             return {'statusCode': 400, 'headers': CORS,
                     'body': json.dumps({'error': 'Укажите телефон и никнейм'})}
 
-        db = get_db()
-        cur = db.cursor()
-
-        # Проверяем, не зарегистрирован ли уже
+        db = get_db(); cur = db.cursor()
         cur.execute("SELECT id FROM icq_users WHERE phone=%s", (phone,))
         if cur.fetchone():
             cur.close(); db.close()
             return {'statusCode': 409, 'headers': CORS,
                     'body': json.dumps({'error': 'Этот номер уже зарегистрирован. Войди через вход.'})}
+        cur.close(); db.close()
 
-        # Генерируем уникальный UIN
-        uin = generate_uin()
-        while True:
-            cur.execute("SELECT id FROM icq_users WHERE uin=%s", (uin,))
-            if not cur.fetchone():
-                break
-            uin = generate_uin()
-
-        cur.execute(
-            "INSERT INTO icq_users (uin, phone, nickname, status) VALUES (%s, %s, %s, 'online') "
-            "RETURNING id, uin, nickname, first_name, last_name, status, avatar_url",
-            (uin, phone, nickname)
-        )
-        user = cur.fetchone()
-        token = create_session(cur, user[0])
-        db.commit(); cur.close(); db.close()
-
-        return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({
-            'success': True,
-            'token': token,
-            'user': {
-                'id': user[0], 'uin': user[1], 'nickname': user[2],
-                'first_name': user[3], 'last_name': user[4],
-                'status': user[5], 'avatar_url': user[6]
-            }
-        })}
+        resp = make_request(phone, 'register', nickname)
+        return {'statusCode': 200, 'headers': CORS, 'body': json.dumps(resp)}
 
     # ── POST /request-login ────────────────────────────────────────────────────
-    # Существующий пользователь хочет войти → создаём запрос и шлём SMS
+    # Существующий пользователь хочет войти → шлём SMS «Это вы?»
     if method == 'POST' and '/request-login' in path:
         body = json.loads(event.get('body') or '{}')
         phone = normalize_phone(body.get('phone', ''))
@@ -131,59 +129,40 @@ def handler(event: dict, context) -> dict:
             return {'statusCode': 400, 'headers': CORS,
                     'body': json.dumps({'error': 'Укажите номер телефона'})}
 
-        db = get_db()
-        cur = db.cursor()
-        cur.execute("SELECT id, nickname FROM icq_users WHERE phone=%s", (phone,))
-        user = cur.fetchone()
-        if not user:
+        db = get_db(); cur = db.cursor()
+        cur.execute("SELECT id FROM icq_users WHERE phone=%s", (phone,))
+        if not cur.fetchone():
             cur.close(); db.close()
             return {'statusCode': 404, 'headers': CORS,
                     'body': json.dumps({'error': 'Аккаунт с таким номером не найден. Сначала зарегистрируйся.'})}
+        cur.close(); db.close()
 
-        confirm_token = secrets.token_hex(24)
-        expires = datetime.now() + timedelta(minutes=10)
-        cur.execute(
-            "INSERT INTO icq_login_requests (token, phone, status, expires_at) VALUES (%s, %s, 'pending', %s)",
-            (confirm_token, phone, expires)
-        )
-        db.commit(); cur.close(); db.close()
-
-        # Ссылки для SMS (или базовый URL нашего бэкенда)
-        base_url = os.environ.get('AUTH_BASE_URL', 'https://functions.poehali.dev/e32fdd23-017b-4fb1-9618-d70e0b0977d0')
-        sms_result = send_sms_confirm(phone, confirm_token, base_url)
-        demo_mode = not os.environ.get('SMSRU_API_KEY')
-
-        resp = {'success': True, 'request_token': confirm_token, 'demo': demo_mode}
-        if demo_mode:
-            resp['yes_url'] = f'{base_url}/confirm-login?token={confirm_token}&answer=yes'
-            resp['no_url']  = f'{base_url}/confirm-login?token={confirm_token}&answer=no'
+        resp = make_request(phone, 'login')
         return {'statusCode': 200, 'headers': CORS, 'body': json.dumps(resp)}
 
     # ── GET /confirm-login?token=…&answer=yes|no ───────────────────────────────
-    # Пользователь нажал ссылку в SMS → подтверждаем или отклоняем
     if method == 'GET' and '/confirm-login' in path:
         params = event.get('queryStringParameters') or {}
         confirm_token = params.get('token', '')
-        answer = params.get('answer', '')  # 'yes' или 'no'
+        answer = params.get('answer', '')
 
         if not confirm_token or answer not in ('yes', 'no'):
             return {'statusCode': 400, 'headers': CORS,
                     'body': json.dumps({'error': 'Некорректный запрос'})}
 
-        db = get_db()
-        cur = db.cursor()
+        db = get_db(); cur = db.cursor()
         cur.execute(
-            "SELECT id, phone, status FROM icq_login_requests WHERE token=%s AND expires_at > NOW()",
+            "SELECT id, phone, status, nickname, request_type FROM icq_login_requests "
+            "WHERE token=%s AND expires_at > NOW()",
             (confirm_token,)
         )
         req = cur.fetchone()
         if not req:
             cur.close(); db.close()
-            # Красивая HTML-страница для браузера
             return {
                 'statusCode': 200,
                 'headers': {**CORS, 'Content-Type': 'text/html; charset=utf-8'},
-                'body': html_page('⏰ Ссылка истекла', 'Эта ссылка уже недействительна.<br>Попробуй войти снова.', '#e53935')
+                'body': html_page('⏰ Ссылка истекла', 'Эта ссылка уже недействительна.<br>Попробуй снова.', '#e53935')
             }
 
         if req[2] != 'pending':
@@ -194,35 +173,62 @@ def handler(event: dict, context) -> dict:
                 'body': html_page('ℹ️ Уже обработано', 'Этот запрос уже был обработан.', '#ffc107')
             }
 
-        new_status = 'approved' if answer == 'yes' else 'rejected'
-        cur.execute("UPDATE icq_login_requests SET status=%s WHERE id=%s", (new_status, req[0]))
-        db.commit(); cur.close(); db.close()
+        req_id, phone, _, nickname, request_type = req
 
-        if answer == 'yes':
-            return {
-                'statusCode': 200,
-                'headers': {**CORS, 'Content-Type': 'text/html; charset=utf-8'},
-                'body': html_page('✅ Вход подтверждён!', 'Вы успешно подтвердили вход в ICQ.<br>Можете закрыть эту страницу.', '#4caf50')
-            }
+        if answer == 'no':
+            cur.execute("UPDATE icq_login_requests SET status='rejected' WHERE id=%s", (req_id,))
+            db.commit(); cur.close(); db.close()
+            if request_type == 'register':
+                return {'statusCode': 200, 'headers': {**CORS, 'Content-Type': 'text/html; charset=utf-8'},
+                        'body': html_page('❌ Регистрация отменена', 'Регистрация аккаунта ICQ отменена.<br>Можете закрыть эту страницу.', '#e53935')}
+            return {'statusCode': 200, 'headers': {**CORS, 'Content-Type': 'text/html; charset=utf-8'},
+                    'body': html_page('🚫 Вход отклонён', 'Вы отклонили вход в ICQ.<br>Если это были не вы — ваш аккаунт в безопасности.', '#e53935')}
+
+        # answer == 'yes'
+        if request_type == 'register':
+            # Создаём аккаунт прямо здесь
+            cur.execute("SELECT id FROM icq_users WHERE phone=%s", (phone,))
+            if cur.fetchone():
+                cur.execute("UPDATE icq_login_requests SET status='rejected' WHERE id=%s", (req_id,))
+                db.commit(); cur.close(); db.close()
+                return {'statusCode': 200, 'headers': {**CORS, 'Content-Type': 'text/html; charset=utf-8'},
+                        'body': html_page('⚠️ Уже зарегистрирован', 'Аккаунт с этим номером уже существует.<br>Войди через кнопку «Вход».', '#ffc107')}
+
+            uin = generate_uin()
+            while True:
+                cur.execute("SELECT id FROM icq_users WHERE uin=%s", (uin,))
+                if not cur.fetchone(): break
+                uin = generate_uin()
+
+            cur.execute(
+                "INSERT INTO icq_users (uin, phone, nickname, status) VALUES (%s, %s, %s, 'offline') RETURNING id",
+                (uin, phone, nickname or f'User{uin}')
+            )
+            cur.execute("UPDATE icq_login_requests SET status='approved' WHERE id=%s", (req_id,))
+            db.commit(); cur.close(); db.close()
+            return {'statusCode': 200, 'headers': {**CORS, 'Content-Type': 'text/html; charset=utf-8'},
+                    'body': html_page('✅ Аккаунт создан!',
+                        f'Добро пожаловать в ICQ, <strong>{nickname}</strong>!<br>'
+                        f'Ваш UIN: <strong style="font-size:20px;letter-spacing:2px">{uin}</strong><br><br>'
+                        'Вернитесь на страницу регистрации — она обновится автоматически.', '#4caf50')}
         else:
-            return {
-                'statusCode': 200,
-                'headers': {**CORS, 'Content-Type': 'text/html; charset=utf-8'},
-                'body': html_page('🚫 Вход отклонён', 'Вы отклонили вход. Если это были не вы — смените номер телефона.<br>Можете закрыть эту страницу.', '#e53935')
-            }
+            # login — просто помечаем approved, сессию создадим в poll
+            cur.execute("UPDATE icq_login_requests SET status='approved' WHERE id=%s", (req_id,))
+            db.commit(); cur.close(); db.close()
+            return {'statusCode': 200, 'headers': {**CORS, 'Content-Type': 'text/html; charset=utf-8'},
+                    'body': html_page('✅ Вход подтверждён!',
+                        'Вы вошли в ICQ.<br>Вернитесь на страницу — она обновится автоматически.<br>Можете закрыть эту вкладку.', '#4caf50')}
 
     # ── GET /poll-login?token=… ────────────────────────────────────────────────
-    # Фронтенд опрашивает статус запроса
     if method == 'GET' and '/poll-login' in path:
         params = event.get('queryStringParameters') or {}
         confirm_token = params.get('token', '')
         if not confirm_token:
             return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Нет токена'})}
 
-        db = get_db()
-        cur = db.cursor()
+        db = get_db(); cur = db.cursor()
         cur.execute(
-            "SELECT r.id, r.phone, r.status, r.expires_at FROM icq_login_requests r WHERE r.token=%s",
+            "SELECT id, phone, status, expires_at, nickname, request_type FROM icq_login_requests WHERE token=%s",
             (confirm_token,)
         )
         req = cur.fetchone()
@@ -230,29 +236,32 @@ def handler(event: dict, context) -> dict:
             cur.close(); db.close()
             return {'statusCode': 404, 'headers': CORS, 'body': json.dumps({'status': 'not_found'})}
 
-        req_status = req[2]
-        expires_at = req[3]
+        req_id, phone, req_status, expires_at, nickname, request_type = req
 
         if expires_at < datetime.now():
             cur.close(); db.close()
             return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'status': 'expired'})}
 
         if req_status == 'approved':
-            # Создаём сессию
-            phone = req[1]
-            cur.execute(
-                "SELECT id, uin, nickname, first_name, last_name, status, avatar_url FROM icq_users WHERE phone=%s",
-                (phone,)
-            )
+            if request_type == 'register':
+                # Аккаунт уже создан в confirm-login, просто находим и выдаём сессию
+                cur.execute(
+                    "SELECT id, uin, nickname, first_name, last_name, status, avatar_url FROM icq_users WHERE phone=%s",
+                    (phone,)
+                )
+            else:
+                cur.execute(
+                    "SELECT id, uin, nickname, first_name, last_name, status, avatar_url FROM icq_users WHERE phone=%s",
+                    (phone,)
+                )
             user = cur.fetchone()
             if not user:
                 cur.close(); db.close()
-                return {'statusCode': 404, 'headers': CORS, 'body': json.dumps({'status': 'error'})}
+                return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'status': 'pending'})}
 
             cur.execute("UPDATE icq_users SET status='online', last_seen=NOW() WHERE id=%s", (user[0],))
             session_token = create_session(cur, user[0])
-            # Помечаем запрос как использованный
-            cur.execute("UPDATE icq_login_requests SET status='used' WHERE id=%s", (req[0],))
+            cur.execute("UPDATE icq_login_requests SET status='used' WHERE id=%s", (req_id,))
             db.commit(); cur.close(); db.close()
 
             return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({
