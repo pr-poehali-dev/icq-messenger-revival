@@ -130,216 +130,290 @@ function formatTime(isoStr: string) {
 
 // ─── Login Screen ───────────────────────────────────────────────────────────
 function LoginScreen({ onLogin }: { onLogin: (token: string, user: User) => void }) {
-  const [step, setStep] = useState<'phone' | 'code' | 'profile'>('phone');
+  // 'choice' → выбор входа/регистрации
+  // 'register' → форма регистрации (телефон + никнейм)
+  // 'login-phone' → ввод телефона для входа
+  // 'login-waiting' → ожидаем подтверждения по SMS
+  const [step, setStep] = useState<'choice' | 'register' | 'login-phone' | 'login-waiting'>('choice');
   const [phone, setPhone] = useState('');
-  const [code, setCode] = useState('');
   const [nickname, setNickname] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [demoCode, setDemoCode] = useState('');
-  const [token, setToken] = useState('');
-  const [pendingUser, setPendingUser] = useState<User | null>(null);
-  const [isNew, setIsNew] = useState(false);
+  const [confirmToken, setConfirmToken] = useState('');
+  const [demoUrls, setDemoUrls] = useState<{ yes: string; no: string } | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  async function sendCode() {
-    setLoading(true);
-    setError('');
+  // Очищаем поллинг при смене шага
+  useEffect(() => {
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
+
+  // ── Регистрация ─────────────────────────────────────────────────────────────
+  async function register() {
+    if (!phone.trim() || !nickname.trim()) { setError('Заполни все поля'); return; }
+    setLoading(true); setError('');
     try {
-      const r = await fetch(`${AUTH_URL}/send-code`, {
+      const r = await fetch(`${AUTH_URL}/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone, nickname: nickname.trim() }),
+      });
+      const d = await r.json();
+      if (!d.success) { setError(d.error || 'Ошибка'); return; }
+      onLogin(d.token, d.user);
+    } catch { setError('Ошибка сети'); }
+    finally { setLoading(false); }
+  }
+
+  // ── Запрос на вход ──────────────────────────────────────────────────────────
+  async function requestLogin() {
+    if (!phone.trim()) { setError('Введи номер телефона'); return; }
+    setLoading(true); setError('');
+    try {
+      const r = await fetch(`${AUTH_URL}/request-login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ phone }),
       });
       const d = await r.json();
       if (!d.success) { setError(d.error || 'Ошибка'); return; }
-      if (d.demo) setDemoCode(d.code);
-      setStep('code');
-    } catch {
-      setError('Ошибка сети');
-    } finally {
-      setLoading(false);
-    }
+      setConfirmToken(d.request_token);
+      if (d.demo) setDemoUrls({ yes: d.yes_url, no: d.no_url });
+      setStep('login-waiting');
+      startPolling(d.request_token);
+    } catch { setError('Ошибка сети'); }
+    finally { setLoading(false); }
   }
 
-  async function verifyCode() {
-    setLoading(true);
-    setError('');
-    try {
-      const r = await fetch(`${AUTH_URL}/verify-code`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone, code }),
-      });
-      const d = await r.json();
-      if (!d.success) { setError(d.error || 'Неверный код'); return; }
-      setToken(d.token);
-      setPendingUser(d.user);
-      setIsNew(d.is_new);
-      if (d.is_new) {
-        setNickname('');
-        setStep('profile');
-      } else {
-        onLogin(d.token, d.user);
-      }
-    } catch {
-      setError('Ошибка сети');
-    } finally {
-      setLoading(false);
-    }
+  // ── Поллинг статуса ─────────────────────────────────────────────────────────
+  function startPolling(token: string) {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const r = await fetch(`${AUTH_URL}/poll-login?token=${token}`);
+        const d = await r.json();
+        if (d.status === 'approved') {
+          clearInterval(pollRef.current!);
+          onLogin(d.token, d.user);
+        } else if (d.status === 'rejected') {
+          clearInterval(pollRef.current!);
+          setStep('login-phone');
+          setError('Вход отклонён. Это были не вы?');
+          setDemoUrls(null);
+        } else if (d.status === 'expired') {
+          clearInterval(pollRef.current!);
+          setStep('login-phone');
+          setError('Время вышло. Попробуй снова.');
+          setDemoUrls(null);
+        }
+      } catch { /* игнорируем ошибки сети при поллинге */ }
+    }, 2000);
   }
 
-  async function saveProfile() {
-    if (!nickname.trim()) { setError('Введи никнейм'); return; }
-    setLoading(true);
-    try {
-      await fetch(`${AUTH_URL}/profile`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', 'X-Auth-Token': token },
-        body: JSON.stringify({ nickname: nickname.trim() }),
-      });
-      onLogin(token, { ...pendingUser!, nickname: nickname.trim() });
-    } catch {
-      setError('Ошибка');
-    } finally {
-      setLoading(false);
-    }
+  function cancelWaiting() {
+    if (pollRef.current) clearInterval(pollRef.current);
+    setStep('login-phone');
+    setDemoUrls(null);
+    setConfirmToken('');
   }
 
-  return (
+  const AuthCard = ({ children }: { children: React.ReactNode }) => (
     <div style={{
       minHeight: '100vh',
       background: 'linear-gradient(135deg, #1a4a7a 0%, #2878c0 40%, #1c5a8a 100%)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       fontFamily: "'Rubik', 'Tahoma', sans-serif",
     }}>
-      {/* Background pattern */}
       <div style={{
         position: 'fixed', inset: 0, opacity: 0.04,
         backgroundImage: 'radial-gradient(circle, white 1px, transparent 1px)',
-        backgroundSize: '30px 30px',
-        pointerEvents: 'none',
+        backgroundSize: '30px 30px', pointerEvents: 'none',
       }} />
-
       <div className="animate-scale-in" style={{
-        background: 'white',
-        borderRadius: 8,
-        boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
-        width: 360,
-        overflow: 'hidden',
+        background: 'white', borderRadius: 8,
+        boxShadow: '0 20px 60px rgba(0,0,0,0.4)', width: 360, overflow: 'hidden',
       }}>
-        {/* Header */}
         <div style={{
           background: 'linear-gradient(180deg, #3a8fd4 0%, #1c5a8a 100%)',
-          padding: '24px 20px 20px',
-          textAlign: 'center',
+          padding: '22px 20px 18px', textAlign: 'center',
         }}>
-          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 12 }}>
-            <ICQFlower size={56} />
+          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 10 }}>
+            <ICQFlower size={52} />
           </div>
-          <div style={{ color: 'white', fontSize: 24, fontWeight: 700, letterSpacing: 2 }}>ICQ</div>
-          <div style={{ color: 'rgba(255,255,255,0.75)', fontSize: 12, marginTop: 2 }}>I Seek You</div>
+          <div style={{ color: 'white', fontSize: 22, fontWeight: 700, letterSpacing: 2 }}>ICQ</div>
+          <div style={{ color: 'rgba(255,255,255,0.7)', fontSize: 11, marginTop: 2 }}>I Seek You</div>
         </div>
-
-        {/* Body */}
-        <div style={{ padding: '24px 24px 28px' }}>
-          {step === 'phone' && (
-            <div className="animate-fade-in">
-              <div style={{ fontSize: 15, fontWeight: 600, color: '#1c5a8a', marginBottom: 16 }}>
-                Вход в ICQ
-              </div>
-              <label style={{ fontSize: 11, color: '#6a7a8a', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5 }}>
-                Номер телефона
-              </label>
-              <input
-                value={phone}
-                onChange={e => setPhone(e.target.value)}
-                placeholder="+7 999 123-45-67"
-                onKeyDown={e => e.key === 'Enter' && sendCode()}
-                style={inputStyle}
-              />
-              {error && <div style={errorStyle}>{error}</div>}
-              <button onClick={sendCode} disabled={loading || !phone} style={btnStyle(loading || !phone)}>
-                {loading ? 'Отправляем...' : 'Получить код →'}
-              </button>
-              <div style={{ textAlign: 'center', marginTop: 16, color: '#8a9ab0', fontSize: 12 }}>
-                Введи номер — пришлём код подтверждения
-              </div>
-            </div>
-          )}
-
-          {step === 'code' && (
-            <div className="animate-fade-in">
-              <button onClick={() => setStep('phone')} style={{ background: 'none', border: 'none', color: '#2878c0', cursor: 'pointer', fontSize: 12, padding: 0, marginBottom: 12 }}>
-                ← Изменить номер
-              </button>
-              <div style={{ fontSize: 15, fontWeight: 600, color: '#1c5a8a', marginBottom: 4 }}>
-                Введи код
-              </div>
-              <div style={{ fontSize: 12, color: '#6a7a8a', marginBottom: 16 }}>
-                Отправили на {phone}
-              </div>
-              {demoCode && (
-                <div style={{
-                  background: '#fffde7', border: '1px solid #ffc107', borderRadius: 4,
-                  padding: '8px 12px', marginBottom: 12, fontSize: 12, color: '#8a6d00'
-                }}>
-                  🔑 Демо-режим. Твой код: <strong style={{ fontSize: 18, letterSpacing: 3 }}>{demoCode}</strong>
-                </div>
-              )}
-              <input
-                value={code}
-                onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                placeholder="_ _ _ _ _ _"
-                maxLength={6}
-                onKeyDown={e => e.key === 'Enter' && verifyCode()}
-                style={{ ...inputStyle, fontSize: 22, letterSpacing: 6, textAlign: 'center' }}
-              />
-              {error && <div style={errorStyle}>{error}</div>}
-              <button onClick={verifyCode} disabled={loading || code.length < 4} style={btnStyle(loading || code.length < 4)}>
-                {loading ? 'Проверяем...' : 'Войти'}
-              </button>
-            </div>
-          )}
-
-          {step === 'profile' && (
-            <div className="animate-fade-in">
-              <div style={{ fontSize: 15, fontWeight: 600, color: '#1c5a8a', marginBottom: 4 }}>
-                Добро пожаловать! 🎉
-              </div>
-              <div style={{ fontSize: 12, color: '#6a7a8a', marginBottom: 16 }}>
-                Придумай никнейм для своего аккаунта
-              </div>
-              <div style={{
-                background: 'linear-gradient(135deg, #e8f4fd, #d0e8f8)',
-                border: '1px solid #b0d0f0',
-                borderRadius: 4, padding: '10px 14px', marginBottom: 16,
-                fontSize: 12, color: '#1c5a8a'
-              }}>
-                🔢 Твой UIN: <strong style={{ fontSize: 16, letterSpacing: 1 }}>{pendingUser?.uin}</strong>
-                <br /><span style={{ color: '#6a7a8a', fontSize: 11 }}>Запомни — это твой ICQ-номер</span>
-              </div>
-              <label style={{ fontSize: 11, color: '#6a7a8a', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5 }}>
-                Никнейм
-              </label>
-              <input
-                value={nickname}
-                onChange={e => setNickname(e.target.value)}
-                placeholder="CoolUser2010"
-                onKeyDown={e => e.key === 'Enter' && saveProfile()}
-                style={inputStyle}
-                autoFocus
-              />
-              {error && <div style={errorStyle}>{error}</div>}
-              <button onClick={saveProfile} disabled={loading || !nickname.trim()} style={btnStyle(loading || !nickname.trim())}>
-                {loading ? 'Сохраняем...' : 'Начать общение →'}
-              </button>
-            </div>
-          )}
-        </div>
+        <div style={{ padding: '22px 24px 26px' }}>{children}</div>
       </div>
     </div>
   );
+
+  // ── Экран выбора ────────────────────────────────────────────────────────────
+  if (step === 'choice') return (
+    <AuthCard>
+      <div className="animate-fade-in">
+        <div style={{ textAlign: 'center', marginBottom: 20 }}>
+          <div style={{ fontSize: 15, fontWeight: 600, color: '#1c5a8a' }}>Добро пожаловать!</div>
+          <div style={{ fontSize: 12, color: '#8a9ab0', marginTop: 4 }}>Выбери, что хочешь сделать</div>
+        </div>
+        <button onClick={() => { setStep('login-phone'); setError(''); }} style={{
+          ...btnStyle(false), marginBottom: 10,
+          background: 'linear-gradient(180deg, #5aabf0 0%, #2878c0 100%)',
+        }}>
+          🔑 Войти в ICQ
+        </button>
+        <button onClick={() => { setStep('register'); setError(''); }} style={{
+          width: '100%', padding: '10px', borderRadius: 3, border: '1px solid #b0d0f0',
+          background: 'linear-gradient(180deg, #f0f8ff 0%, #e0f0fc 100%)',
+          color: '#1c5a8a', fontSize: 13, fontWeight: 600, cursor: 'pointer',
+          fontFamily: "'Rubik', 'Tahoma', sans-serif",
+        }}>
+          ✨ Зарегистрироваться
+        </button>
+        <div style={{ textAlign: 'center', marginTop: 16, color: '#a0b0c0', fontSize: 11 }}>
+          ICQ — классический мессенджер с 1996 года
+        </div>
+      </div>
+    </AuthCard>
+  );
+
+  // ── Регистрация ─────────────────────────────────────────────────────────────
+  if (step === 'register') return (
+    <AuthCard>
+      <div className="animate-fade-in">
+        <button onClick={() => { setStep('choice'); setError(''); }} style={{ background: 'none', border: 'none', color: '#2878c0', cursor: 'pointer', fontSize: 12, padding: 0, marginBottom: 14 }}>
+          ← Назад
+        </button>
+        <div style={{ fontSize: 15, fontWeight: 600, color: '#1c5a8a', marginBottom: 4 }}>Регистрация</div>
+        <div style={{ fontSize: 12, color: '#8a9ab0', marginBottom: 16 }}>Создай новый аккаунт ICQ</div>
+        <label style={labelStyle}>Номер телефона</label>
+        <input value={phone} onChange={e => setPhone(e.target.value)} placeholder="+7 999 123-45-67" style={inputStyle} />
+        <label style={{ ...labelStyle, marginTop: 10 }}>Никнейм</label>
+        <input value={nickname} onChange={e => setNickname(e.target.value)} placeholder="CoolUser2010"
+          onKeyDown={e => e.key === 'Enter' && register()} style={inputStyle} />
+        <div style={{ fontSize: 11, color: '#a0b0c0', margin: '6px 0 12px' }}>
+          Никнейм будет виден другим пользователям
+        </div>
+        {error && <div style={errorStyle}>{error}</div>}
+        <button onClick={register} disabled={loading || !phone.trim() || !nickname.trim()} style={btnStyle(loading || !phone.trim() || !nickname.trim())}>
+          {loading ? 'Создаём аккаунт...' : 'Создать аккаунт →'}
+        </button>
+        <div style={{ textAlign: 'center', marginTop: 14, fontSize: 11, color: '#a0b0c0' }}>
+          После регистрации получишь 9-значный UIN
+        </div>
+      </div>
+    </AuthCard>
+  );
+
+  // ── Ввод телефона для входа ─────────────────────────────────────────────────
+  if (step === 'login-phone') return (
+    <AuthCard>
+      <div className="animate-fade-in">
+        <button onClick={() => { setStep('choice'); setError(''); }} style={{ background: 'none', border: 'none', color: '#2878c0', cursor: 'pointer', fontSize: 12, padding: 0, marginBottom: 14 }}>
+          ← Назад
+        </button>
+        <div style={{ fontSize: 15, fontWeight: 600, color: '#1c5a8a', marginBottom: 4 }}>Вход в ICQ</div>
+        <div style={{ fontSize: 12, color: '#8a9ab0', marginBottom: 16 }}>
+          Введи номер — пришлём SMS с запросом подтверждения
+        </div>
+        <label style={labelStyle}>Номер телефона</label>
+        <input value={phone} onChange={e => setPhone(e.target.value)} placeholder="+7 999 123-45-67"
+          onKeyDown={e => e.key === 'Enter' && requestLogin()} style={inputStyle} autoFocus />
+        {error && <div style={errorStyle}>{error}</div>}
+        <button onClick={requestLogin} disabled={loading || !phone.trim()} style={btnStyle(loading || !phone.trim())}>
+          {loading ? 'Отправляем запрос...' : 'Отправить запрос →'}
+        </button>
+      </div>
+    </AuthCard>
+  );
+
+  // ── Ожидание подтверждения ──────────────────────────────────────────────────
+  if (step === 'login-waiting') return (
+    <AuthCard>
+      <div className="animate-fade-in" style={{ textAlign: 'center' }}>
+        <div style={{ fontSize: 40, marginBottom: 12 }}>📱</div>
+        <div style={{ fontSize: 15, fontWeight: 600, color: '#1c5a8a', marginBottom: 8 }}>
+          Подтвердите вход
+        </div>
+        <div style={{ fontSize: 12, color: '#6a7a8a', marginBottom: 20, lineHeight: 1.6 }}>
+          На номер <strong>{phone}</strong> отправлено SMS.<br />
+          Нажмите <strong>«Да»</strong> в сообщении, чтобы войти.
+        </div>
+
+        {/* Анимированный индикатор ожидания */}
+        <div style={{ display: 'flex', justifyContent: 'center', gap: 6, marginBottom: 20 }}>
+          {[0, 1, 2].map(i => (
+            <div key={i} style={{
+              width: 10, height: 10, borderRadius: '50%', background: '#2878c0',
+              animation: `status-pulse 1.2s ease ${i * 0.3}s infinite`,
+            }} />
+          ))}
+        </div>
+
+        {/* Демо-режим: показываем ссылки прямо на экране */}
+        {demoUrls && (
+          <div style={{
+            background: '#fffde7', border: '1px solid #ffc107', borderRadius: 6,
+            padding: '14px 16px', marginBottom: 16, textAlign: 'left',
+          }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: '#8a6d00', marginBottom: 10 }}>
+              📲 Демо-режим — SMS-сервис не подключён.<br />Нажми кнопку вместо SMS:
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <a href={demoUrls.yes} target="_blank" rel="noreferrer" style={{
+                flex: 1, padding: '10px', borderRadius: 4, textDecoration: 'none',
+                background: 'linear-gradient(180deg, #66bb6a, #388e3c)', color: 'white',
+                fontSize: 13, fontWeight: 700, textAlign: 'center', display: 'block',
+                boxShadow: '0 2px 8px rgba(56,142,60,0.4)',
+              }}>
+                ✅ Да, это я
+              </a>
+              <a href={demoUrls.no} target="_blank" rel="noreferrer" style={{
+                flex: 1, padding: '10px', borderRadius: 4, textDecoration: 'none',
+                background: 'linear-gradient(180deg, #ef5350, #c62828)', color: 'white',
+                fontSize: 13, fontWeight: 700, textAlign: 'center', display: 'block',
+                boxShadow: '0 2px 8px rgba(198,40,40,0.4)',
+              }}>
+                ❌ Нет, не я
+              </a>
+            </div>
+          </div>
+        )}
+
+        <button onClick={cancelWaiting} style={{
+          background: 'none', border: '1px solid #c0d0e0', color: '#6a7a8a',
+          borderRadius: 3, padding: '8px 20px', cursor: 'pointer', fontSize: 12,
+          fontFamily: "'Rubik', 'Tahoma', sans-serif",
+        }}>
+          Отменить
+        </button>
+        <div style={{ marginTop: 12, fontSize: 11, color: '#a0b0c0' }}>
+          Ссылка действует 10 минут
+        </div>
+      </div>
+    </AuthCard>
+  );
+
+  // fallback
+  return (
+    <AuthCard>
+      <div className="animate-fade-in">
+        <div style={{ fontSize: 15, fontWeight: 600, color: '#1c5a8a', marginBottom: 16 }}>
+          Вход в ICQ
+        </div>
+        <div style={{ fontSize: 12, color: '#6a7a8a', marginBottom: 16 }}>
+          Придумай никнейм для своего аккаунта
+        </div>
+        <div style={{ fontSize: 12, color: '#6a7a8a' }}>Ошибка состояния</div>
+      </div>
+    </AuthCard>
+  );
 }
+
+const labelStyle: React.CSSProperties = {
+  fontSize: 11, color: '#6a7a8a', fontWeight: 600,
+  textTransform: 'uppercase', letterSpacing: 0.5, display: 'block',
+};
 
 const inputStyle: React.CSSProperties = {
   width: '100%', border: '1px solid #b0c8e0', borderRadius: 3,
